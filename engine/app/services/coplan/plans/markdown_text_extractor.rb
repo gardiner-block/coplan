@@ -104,20 +104,30 @@ module CoPlan
           end
 
           case child.type
+          when :table_cell
+            @cell_line = source_position(child)[:start_line]
+            @cell_escapes = removed_pipe_escapes(child)
+            extract_text_nodes(child, line_byte_offsets, byte_to_char, stripped, pos_map)
+            @cell_line = @cell_escapes = nil
           when :html_block
             append_html_block(child, stripped, pos_map) if @source_spans
           when :text
-            pos = @source_spans && node.type == :escaped ? node.source_position : child.source_position
+            pos = @source_spans && node.type == :escaped ? source_position(node) : source_position(child)
             start_byte = line_byte_offsets[pos[:start_line]] + pos[:start_column] - 1
             char_idx = byte_to_char[start_byte]
             if @source_spans
               end_byte = line_byte_offsets[pos[:end_line]] + pos[:end_column] - 1
               append_decoded_text(child.string_content, char_idx, byte_to_char[end_byte], stripped, pos_map)
-            else
-              child.string_content.each_char.with_index do |char, i|
+            elsif char_idx
+              removed = removed_escape_chars(line_byte_offsets, byte_to_char)
+              child.string_content.each_char do |char|
+                char_idx += 1 while removed.include?(char_idx)
                 stripped << char
-                pos_map << (char_idx + i)
+                pos_map << char_idx
+                char_idx += 1
               end
+            else
+              child.string_content.each_char { |char| append_separator(stripped, pos_map, char) }
             end
           when :code
             if @source_spans
@@ -126,12 +136,21 @@ module CoPlan
             end
             # source_position includes backtick delimiters; find the inner
             # content start by scanning past them in the raw string.
-            pos = child.source_position
+            pos = source_position(child)
             start_byte = line_byte_offsets[pos[:start_line]] + pos[:start_column] - 1
             node_char_start = byte_to_char[start_byte]
             end_byte = line_byte_offsets[pos[:end_line]] + pos[:end_column] - 1
             node_char_end = byte_to_char[end_byte]
             text = child.string_content
+            unless node_char_start && node_char_end
+              # Unmappable position: keep the text, drop the anchor.
+              text.each_char { |char| append_separator(stripped, pos_map, char) }
+              next
+            end
+            if removed_escape_chars(line_byte_offsets, byte_to_char).any? { |index| index.between?(node_char_start, node_char_end) }
+              append_inline_code(child, line_byte_offsets, byte_to_char, stripped, pos_map)
+              next
+            end
             node_char_len = node_char_end - node_char_start + 1
             tick_len = (node_char_len - text.length) / 2
             content_char_start = node_char_start + tick_len
@@ -149,7 +168,7 @@ module CoPlan
             # fence to the closing fence. The string_content is the inner
             # text (excluding fences). Content starts on the line after
             # the opening fence.
-            pos = child.source_position
+            pos = source_position(child)
             text = child.string_content
             content_line = pos[:start_line] + 1
             if content_line <= line_byte_offsets.length - 1
@@ -170,7 +189,7 @@ module CoPlan
             marker, span = footnote_marker(child, line_byte_offsets, byte_to_char)
             marker.each_char { |char| append_separator(stripped, pos_map, char, source_span: span) }
           when :softbreak, :linebreak
-            pos = child.source_position
+            pos = source_position(child)
             start_byte = line_byte_offsets[pos[:start_line]] + pos[:start_column] - 1
             stripped << "\n"
             pos_map << byte_to_char[start_byte]
@@ -179,6 +198,40 @@ module CoPlan
             extract_text_nodes(child, line_byte_offsets, byte_to_char, stripped, pos_map)
           end
         end
+      end
+
+      # comrak drops the backslash from each `\|` in a table cell before
+      # parsing the cell's inlines, then reports their columns in that
+      # shortened text. Every column after an escape drifts left by one, so
+      # an end column can land inside a multibyte character (`\|░`) and miss
+      # the byte map entirely. The cell's own span is reported correctly.
+      def source_position(node)
+        pos = node.source_position
+        return pos unless @cell_escapes&.any?
+
+        pos.merge(start_column: unescaped_column(pos[:start_column]), end_column: unescaped_column(pos[:end_column]))
+      end
+
+      def unescaped_column(column)
+        @cell_escapes.reduce(column) { |shifted, backslash| shifted >= backslash ? shifted + 1 : shifted }
+      end
+
+      # 1-based byte columns of the backslashes comrak removed: the last of
+      # an odd run of backslashes directly before a pipe (`\\|` stays as is).
+      PIPE_ESCAPE = /(?<!\\)(?:\\\\)*\\(?=\|)/n.freeze
+
+      def removed_pipe_escapes(cell)
+        pos = cell.source_position
+        @lines ||= @content.lines
+        line = @lines[pos[:start_line] - 1].to_s.b
+        source = line.byteslice(pos[:start_column] - 1, pos[:end_column] - pos[:start_column] + 1).to_s
+        source.to_enum(:scan, PIPE_ESCAPE).map { pos[:start_column] + Regexp.last_match.end(0) - 1 }
+      end
+
+      def removed_escape_chars(lines, bytes)
+        return [] unless @cell_escapes&.any?
+
+        @cell_escapes.map { |column| bytes[lines[@cell_line] + column - 1] }
       end
 
       ENTITY = /\A&(?:\#[0-9]{1,7}|\#[xX][0-9a-fA-F]{1,6}|[A-Za-z][A-Za-z0-9]{1,31});/.freeze
@@ -224,7 +277,7 @@ module CoPlan
       HTML_TAG = /<!--.*?(?:-->|\z)|<\/?[A-Za-z][\w:-]*(?:[^>"']|"[^"]*"|'[^']*')*>|<![^>]*>|<\?[^>]*\?>/m.freeze
 
       def append_html_block(node, stripped, positions)
-        pos = node.source_position
+        pos = source_position(node)
         first = @source_line_offsets.fetch(pos[:start_line] - 1) +
           @source_lines.fetch(pos[:start_line] - 1).byteslice(0, pos[:start_column] - 1).length
         last = @source_line_offsets.fetch(pos[:end_line] - 1) +
@@ -260,10 +313,12 @@ module CoPlan
       end
 
       def append_inline_code(node, lines, bytes, stripped, positions)
-        pos = node.source_position
+        pos = source_position(node)
         first = bytes[lines[pos[:start_line]] + pos[:start_column] - 1]
         last = bytes[lines[pos[:end_line]] + pos[:end_column] - 1]
         chars = @content[first..last].chars.each_with_index.to_a
+        removed = removed_escape_chars(lines, bytes)
+        chars.reject! { |_, index| removed.include?(first + index) }
         left, right = 0, chars.length
         left += 1 while chars[left]&.first == "`"
         right -= 1 while right > left && chars[right - 1]&.first == "`"
@@ -283,7 +338,7 @@ module CoPlan
       end
 
       def append_code_block(node, stripped, positions)
-        pos = node.source_position
+        pos = source_position(node)
         first_line = pos[:start_line] - 1
         opening = @source_lines[first_line].to_s[(pos[:start_column] - 1)..]
         # Indented code can itself start with literal fence characters.
@@ -318,7 +373,7 @@ module CoPlan
         return true if node.type == :code_block && node.fence_info.to_s.split.first == "mermaid"
         return false unless node.type == :paragraph
 
-        pos = node.source_position
+        pos = source_position(node)
         pos[:start_line] == pos[:end_line] && ContentRegions::Iframe.call(@source_lines[pos[:start_line] - 1].to_s.chomp)
       end
 
@@ -336,7 +391,7 @@ module CoPlan
       # twice keeps its original number, so the count is keyed on the label —
       # which the node itself won't hand over, but its source span will.
       def footnote_marker(node, line_byte_offsets, byte_to_char)
-        pos = node.source_position
+        pos = source_position(node)
         start_char = byte_to_char[line_byte_offsets[pos[:start_line]] + pos[:start_column] - 1]
         end_char = byte_to_char[line_byte_offsets[pos[:end_line]] + pos[:end_column] - 1]
         return [ "", nil ] unless start_char && end_char

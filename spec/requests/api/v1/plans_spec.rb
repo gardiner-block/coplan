@@ -216,6 +216,18 @@ RSpec.describe "Api::V1::Plans", type: :request do
     expect(JSON.parse(response.body)["title"]).to eq("Untitled")
   end
 
+  # cash-web i18n keys look like "<English>|░context░|<context>". Written in
+  # a table cell, the pipes are escaped and ░ is multibyte.
+  it "creates a plan with an escaped-pipe i18n key in a table cell" do
+    content = "# Keys\n\n| Client | Key |\n|---|---|\n| web | `\"Send\\|░context░\\|button\"` |\n"
+    post api_v1_plans_path, params: { content: content }, headers: headers, as: :json
+
+    expect(response).to have_http_status(:created)
+    plan = CoPlan::Plan.find(JSON.parse(response.body).fetch("id"))
+    expect(plan.current_content).to eq(content)
+    expect(plan.search_text).to include("\"Send|░context░|button\"")
+  end
+
   describe "filing on create" do
     it "files the plan via folder_path, creating the hierarchy in the caller's library" do
       post api_v1_plans_path, params: { title: "Filed Plan", content: "# Filed", folder_path: "Team EBT/Q3/Android/Rollout/Retro" }, headers: headers, as: :json
